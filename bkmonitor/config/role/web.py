@@ -244,6 +244,66 @@ if USE_DJANGO_CACHE_REDIS:
     CACHES["default"] = CACHES["redis"]
     CACHES["login_db"] = CACHES["redis"]
 
+# Redis 配置（用于 alarm_backends.core.storage.redis）
+# 这些配置在 worker 角色中存在，但在 web 角色中缺失，导致导入 alarm_backends 模块时出错
+from config.tools.redis import get_redis_settings, get_cache_redis_settings
+
+# 获取 Redis 基础配置
+CACHE_BACKEND_TYPE, REDIS_HOST, REDIS_PORT, REDIS_PASSWD, REDIS_MASTER_NAME, REDIS_SENTINEL_PASS = get_redis_settings()
+
+# 获取 Cache Redis 配置
+(
+    CACHE_REDIS_HOST,
+    CACHE_REDIS_PORT,
+    CACHE_REDIS_PASSWD,
+    CACHE_REDIS_MASTER_NAME,
+    CACHE_REDIS_SENTINEL_PASS,
+) = get_cache_redis_settings(CACHE_BACKEND_TYPE)
+CACHE_REDIS_HOST, CACHE_REDIS_PORT, CACHE_REDIS_PASSWD, CACHE_REDIS_MASTER_NAME, CACHE_REDIS_SENTINEL_PASS = (
+    CACHE_REDIS_HOST or REDIS_HOST,
+    CACHE_REDIS_PORT or REDIS_PORT,
+    CACHE_REDIS_PASSWD if CACHE_REDIS_PASSWD is None else REDIS_PASSWD,
+    CACHE_REDIS_MASTER_NAME or REDIS_MASTER_NAME,
+    CACHE_REDIS_SENTINEL_PASS if CACHE_REDIS_SENTINEL_PASS is None else REDIS_SENTINEL_PASS,
+)
+
+# 如果 REDIS_HOST 等为 None，使用默认值
+REDIS_HOST = REDIS_HOST or "127.0.0.1"
+REDIS_PORT = int(REDIS_PORT or 6379)
+REDIS_PASSWD = REDIS_PASSWD or ""
+
+# redis中的db分配[7，8，9，10]，共4个db
+# 7.[不重要，可清理] 日志相关数据使用log配置
+# 8.[一般，可清理]   配置相关缓存使用cache配置，例如：cmdb的数据、策略、屏蔽等配置数据
+# 9.[重要，不可清理] 各个services之间交互的队列，使用queue配置
+# 9.[重要，不可清理] celery的broker，使用celery配置
+# 10.[重要，不可清理] service自身的数据，使用service配置
+REDIS_LOG_CONF = {"host": REDIS_HOST, "port": REDIS_PORT, "db": 7, "password": REDIS_PASSWD}
+REDIS_CACHE_CONF = {"host": REDIS_HOST, "port": REDIS_PORT, "db": 8, "password": REDIS_PASSWD}
+REDIS_CELERY_CONF = REDIS_QUEUE_CONF = {"host": REDIS_HOST, "port": REDIS_PORT, "db": 9, "password": REDIS_PASSWD}
+REDIS_SERVICE_CONF = {"host": REDIS_HOST, "port": REDIS_PORT, "db": 10, "password": REDIS_PASSWD, "socket_timeout": 10}
+
+# RabbitMQ 配置（用于 alarm_backends.service.scheduler.app）
+# 这些配置在 worker 角色中存在，但在 web 角色中缺失，导致导入 alarm_backends 模块时出错
+from config.tools.rabbitmq import get_rabbitmq_settings
+
+RABBITMQ_HOST, RABBITMQ_PORT, RABBITMQ_VHOST, RABBITMQ_USER, RABBITMQ_PASS, _ = get_rabbitmq_settings(
+    app_code=APP_CODE, backend=True
+)
+
+# Consul 配置（用于 metadata 模块的 feature_flag 和 storage 配置刷新）
+# 这些配置在 worker 角色中存在，但在 web 角色中缺失，导致刷新到 Consul 时出错
+from config.tools.consul import get_consul_settings
+
+(
+    CONSUL_CLIENT_HOST,
+    CONSUL_CLIENT_PORT,
+    CONSUL_HTTPS_PORT,
+    CONSUL_CLIENT_CERT_FILE,
+    CONSUL_CLIENT_KEY_FILE,
+    CONSUL_SERVER_CA_CERT,
+) = get_consul_settings()
+
 #
 # Cookies & Sessions
 #
