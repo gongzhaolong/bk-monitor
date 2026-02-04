@@ -74,6 +74,7 @@ from .space import (
     SpaceStickyInfo,
     SpaceType,
 )
+from .feature_flag import FeatureFlag
 from .storage import (
     ArgusStorage,
     BkDataStorage,
@@ -161,4 +162,6 @@ __all__ = [
     # resource relation
     "EntityMeta",
     "CustomRelationStatus",
+    # feature flag
+    "FeatureFlag",
 ]

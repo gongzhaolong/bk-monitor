@@ -15,12 +15,133 @@ import time
 from typing import Optional, Any
 
 from django.conf import settings
+from django.db import models
 from metadata import config
 from metadata.utils import consul_tools
 from metadata.utils.redis_tools import RedisTools
+from constants.common import DEFAULT_TENANT_ID
+from bkmonitor.utils.db.fields import JsonField
 
 logger = logging.getLogger("metadata")
 
+
+class FeatureFlag(models.Model):
+    """
+    特性开关数据库模型
+    用于存储特性开关配置信息，包括 variations、targeting、defaultRule 等
+    """
+    flag_id = models.AutoField("特性开关ID", primary_key=True)
+    flag_name = models.CharField("特性开关名称", max_length=128, unique=True, db_index=True)
+    config = JsonField("配置信息", default=dict) # 包含 variations、targeting、defaultRule 等字段
+    is_enabled = models.BooleanField("是否启用", default=True, db_index=True)
+    description = models.CharField("描述", max_length=512, default="", blank=True)
+    created_at = models.DateTimeField("创建时间", auto_now_add=True)
+    updated_at = models.DateTimeField("更新时间", auto_now=True)
+
+    class Meta:
+        db_table = "metadata_featureflag"
+        verbose_name = "特性开关"
+        verbose_name_plural = "特性开关"
+        ordering = ["-updated_at"]
+
+    def __str__(self):
+        return f"{self.flag_name} ({'启用' if self.is_enabled else '禁用'})"
+
+    def to_config_dict(self) -> dict:
+        """
+        将数据库记录转换为配置字典格式
+        用于写入 Consul/Redis
+        
+        :return: 配置字典，包含 variations、targeting、defaultRule 等字段
+        """
+        return self.config if isinstance(self.config, dict) else {}
+
+    def save(self, *args, **kwargs):
+        """
+        重写 save 方法，在保存特性开关配置后自动刷新到 Consul 和 Redis
+        
+        功能说明：
+        1. 调用父类的 save 方法保存到数据库
+        2. 如果特性开关是启用的状态，刷新配置到 Consul 和 Redis
+        3. 如果特性开关被禁用，从 Consul 和 Redis 中移除该配置
+        
+        使用场景：
+        - 管理员在界面上修改特性开关配置后，自动同步到配置中心
+        - 确保配置变更能够及时生效
+        
+        :param args: 位置参数
+        :param kwargs: 关键字参数
+        """
+        # 1. 调用父类的 save 方法
+        super().save(*args, **kwargs)
+        
+        # 2. 自动刷新配置到 Consul 和 Redis
+        try:
+            # 从数据库获取所有启用的特性开关配置
+            from metadata.models.feature_flag import FeatureFlag
+            feature_flag_list = FeatureFlag.objects.filter(is_enabled=True)
+            
+            # 构建配置字典
+            feature_flags_dict = {}
+            for feature_flag in feature_flag_list:
+                config_dict = feature_flag.to_config_dict()
+                if config_dict:
+                    feature_flags_dict[feature_flag.flag_name] = config_dict
+            
+            # 刷新到 Consul
+            FeatureFlagConfig.refresh_consul_feature_flag_config(feature_flags_dict)
+            
+            # 刷新到 Redis
+            FeatureFlagConfig.refresh_redis_feature_flag_config(feature_flags_dict)
+            
+            logger.info(f"feature flag [{self.flag_name}] saved and config refreshed to consul and redis")
+            
+        except Exception as e:  # pylint: disable=broad-except
+            # 捕获所有异常，避免因为配置刷新失败导致保存操作失败
+            logger.error(f"auto refresh feature flag config error after save, flag_name->[{self.flag_name}], error->[{e}]")
+
+    def delete(self, *args, **kwargs):
+        """
+        重写 delete 方法，在删除特性开关后自动刷新配置到 Consul 和 Redis
+        
+        功能说明：
+        1. 记录要删除的特性开关名称
+        2. 调用父类的 delete 方法删除数据库记录
+        3. 刷新配置到 Consul 和 Redis（自动排除已删除的配置）
+        
+        :param args: 位置参数
+        :param kwargs: 关键字参数
+        """
+        # 1. 记录要删除的特性开关名称
+        flag_name = self.flag_name
+        
+        # 2. 调用父类的 delete 方法
+        super().delete(*args, **kwargs)
+        
+        # 3. 自动刷新配置到 Consul 和 Redis
+        try:
+            # 从数据库获取所有启用的特性开关配置（自动排除已删除的配置）
+            from metadata.models.feature_flag import FeatureFlag
+            feature_flag_list = FeatureFlag.objects.filter(is_enabled=True)
+            
+            # 构建配置字典
+            feature_flags_dict = {}
+            for feature_flag in feature_flag_list:
+                config_dict = feature_flag.to_config_dict()
+                if config_dict:
+                    feature_flags_dict[feature_flag.flag_name] = config_dict
+            
+            # 刷新到 Consul
+            FeatureFlagConfig.refresh_consul_feature_flag_config(feature_flags_dict)
+            
+            # 刷新到 Redis
+            FeatureFlagConfig.refresh_redis_feature_flag_config(feature_flags_dict)
+            
+            logger.info(f"feature flag [{flag_name}] deleted and config refreshed to consul and redis")
+            
+        except Exception as e:  # pylint: disable=broad-except
+            # 捕获所有异常，避免因为配置刷新失败导致删除操作失败
+            logger.error(f"auto refresh feature flag config error after delete, flag_name->[{flag_name}], error->[{e}]")
 
 class FeatureFlagConfig:
     """
@@ -31,11 +152,101 @@ class FeatureFlagConfig:
 
     # Consul 配置路径
     CONSUL_PREFIX_PATH = f"{config.CONSUL_PATH}/unify-query/data/feature_flag"
-    # CONSUL_VERSION_PATH = f"{config.CONSUL_PATH}/unify-query/version/feature_flag"
+    CONSUL_VERSION_PATH = f"{config.CONSUL_PATH}/unify-query/version/feature_flag"
     
     # Redis 配置路径，参考 Consul 路径结构
     REDIS_PREFIX_KEY = "bkmonitorv3:unify-query:data:feature_flag"
     # REDIS_VERSION_KEY = "bkmonitorv3:unify-query:version:feature_flag"
+
+    @classmethod
+    def refresh_consul_feature_flag_config_from_db(cls):
+        """
+        从数据库读取特性开关配置并刷新到 Consul
+        参考 ClusterInfo.refresh_consul_storage_config 方法实现
+        
+        功能说明：
+        1. 从数据库获取所有启用的特性开关配置（FeatureFlag.objects.filter(is_enabled=True)）
+        2. 将所有特性开关配置合并为一个 JSON 对象
+        3. 写入到 Consul，路径格式为: {CONSUL_PATH}/unify-query/data/feature_flag
+        
+        :return: None
+        """
+        from metadata.models.feature_flag import FeatureFlag
+        
+        hash_consul = consul_tools.HashConsul()
+        
+        # 1. 从数据库获取所有启用的特性开关配置
+        feature_flag_list = FeatureFlag.objects.filter(is_enabled=True)
+        
+        total_count = feature_flag_list.count()
+        logger.debug(f"total find->[{total_count}] feature flags to refresh to consul")
+        
+        # 2. 构建需要刷新的字典信息，格式为 {flag_name: flag_config}
+        feature_flags_dict = {}
+        for feature_flag in feature_flag_list:
+            config_dict = feature_flag.to_config_dict()
+            if config_dict:
+                feature_flags_dict[feature_flag.flag_name] = config_dict
+        
+        # 3. 如果没有任何配置，记录警告并返回
+        if not feature_flags_dict:
+            logger.warning("no enabled feature flags found in database, skip refresh to consul")
+            return
+        
+        # 4. 构建 Consul 路径，格式: {CONSUL_PATH}/unify-query/data/feature_flag
+        consul_path = cls.CONSUL_PREFIX_PATH
+        
+        # 5. 写入 Consul（所有 flags 存储在一个 key 中）
+        hash_consul.put(key=consul_path, value=feature_flags_dict)
+        logger.debug(f"consul path->[{consul_path}] is refresh with {len(feature_flags_dict)} feature flags success.")
+        
+        # 6. 更新版本时间戳（参考 storage.py 实现）
+        hash_consul.put(key=cls.CONSUL_VERSION_PATH, value={"time": time.time()})
+        logger.debug(f"consul version path->[{cls.CONSUL_VERSION_PATH}] is refresh with timestamp success.")
+        
+        logger.info(f"all feature flag config is refresh to consul success count->[{len(feature_flags_dict)}].")
+
+    @classmethod
+    def refresh_redis_feature_flag_config_from_db(cls):
+        """
+        从数据库读取特性开关配置并刷新到 Redis
+        参考 ClusterInfo.refresh_redis_storage_config 方法实现
+        
+        功能说明：
+        1. 从数据库获取所有启用的特性开关配置（FeatureFlag.objects.filter(is_enabled=True)）
+        2. 将所有特性开关配置合并为一个 JSON 对象
+        3. 写入到 Redis，key 格式为: bkmonitorv3:unify-query:data:feature_flag
+        
+        :return: None
+        """
+        from metadata.models.feature_flag import FeatureFlag
+        
+        # 1. 从数据库获取所有启用的特性开关配置
+        feature_flag_list = FeatureFlag.objects.filter(is_enabled=True)
+        
+        total_count = feature_flag_list.count()
+        logger.debug(f"total find->[{total_count}] feature flags to refresh to redis")
+        
+        # 2. 构建需要刷新的字典信息，格式为 {flag_name: flag_config}
+        feature_flags_dict = {}
+        for feature_flag in feature_flag_list:
+            config_dict = feature_flag.to_config_dict()
+            if config_dict:
+                feature_flags_dict[feature_flag.flag_name] = config_dict
+        
+        # 3. 如果没有任何配置，记录警告并返回
+        if not feature_flags_dict:
+            logger.warning("no enabled feature flags found in database, skip refresh to redis")
+            return
+        
+        # 4. 构建 Redis key，格式: bkmonitorv3:unify-query:data:feature_flag
+        redis_key = cls.REDIS_PREFIX_KEY
+        
+        # 5. 将配置信息序列化为 JSON 字符串并写入 Redis（所有 flags 存储在一个 key 中）
+        RedisTools().client.set(redis_key, json.dumps(feature_flags_dict))
+        logger.debug(f"redis key->[{redis_key}] is refresh with {len(feature_flags_dict)} feature flags success.")
+        
+        logger.info(f"all feature flag config is refresh to redis success count->[{len(feature_flags_dict)}].")
 
     @classmethod
     def refresh_consul_feature_flag_config(cls, feature_flags: dict):
@@ -92,6 +303,10 @@ class FeatureFlagConfig:
         # 3. 写入 Consul（所有 flags 存储在一个 key 中）
         hash_consul.put(key=consul_path, value=config_value)
         logger.debug(f"consul path->[{consul_path}] is refresh with {len(feature_flags)} feature flags success.")
+        
+        # 4. 更新版本时间戳（参考 storage.py 实现）
+        hash_consul.put(key=cls.CONSUL_VERSION_PATH, value={"time": time.time()})
+        logger.debug(f"consul version path->[{cls.CONSUL_VERSION_PATH}] is refresh with timestamp success.")
         
         logger.info(f"all feature flag config is refresh to consul success count->[{len(feature_flags)}].")
 
@@ -408,18 +623,23 @@ class FeatureFlagConfig:
             return None
 
     @classmethod
-    def get_feature_flag_config(cls, flag_name: str, prefer_redis: bool = True) -> Optional[dict]:
+    def get_feature_flag_config(cls, flag_name: str, prefer_redis: bool = False) -> Optional[dict]:
         """
-        获取特性开关配置，优先从 Redis 读取，如果不存在则从 Consul 读取
+        获取特性开关配置，优先从 Consul 读取，如果不存在则从 Redis 读取
         
         功能说明：
         1. 根据 prefer_redis 参数决定优先读取顺序
-        2. 如果 prefer_redis=True，先尝试从 Redis 读取，失败则从 Consul 读取
-        3. 如果 prefer_redis=False，先尝试从 Consul 读取，失败则从 Redis 读取
+        2. 如果 prefer_redis=False（默认），先尝试从 Consul 读取，失败则从 Redis 读取
+        3. 如果 prefer_redis=True，先尝试从 Redis 读取，失败则从 Consul 读取
         4. 如果两者都失败，返回 None
         
+        Consul 优先策略优势：
+        - Consul 作为配置中心，配置更新更及时
+        - 支持分布式配置管理和版本控制
+        - 与存储集群配置保持一致的读取策略
+        
         :param flag_name: 特性开关名称
-        :param prefer_redis: 是否优先从 Redis 读取，默认 True
+        :param prefer_redis: 是否优先从 Redis 读取，默认 False（优先从 Consul 读取）
         :return: 配置字典，如果不存在或读取失败则返回 None
         """
         if prefer_redis:
@@ -439,6 +659,128 @@ class FeatureFlagConfig:
             # Consul 中没有，尝试从 Redis 读取
             return cls.get_redis_feature_flag_config(flag_name)
 
+    @classmethod
+    def get_feature_flag_config_prefer_consul(cls, flag_name: str) -> Optional[dict]:
+        """
+        获取特性开关配置，明确优先从 Consul 读取
+        
+        功能说明：
+        1. 优先从 Consul 读取配置（作为配置中心，更新更及时）
+        2. 如果 Consul 读取失败或不存在，回退到 Redis 读取
+        3. 如果两者都失败，返回 None
+        
+        使用场景：
+        - 需要确保配置实时性的场景
+        - 配置更新后需要立即生效的场景
+        - 与存储集群配置保持一致的读取策略
+        
+        :param flag_name: 特性开关名称
+        :return: 配置字典，如果不存在或读取失败则返回 None
+        """
+        # 优先从 Consul 读取
+        config = cls.get_consul_feature_flag_config(flag_name)
+        if config:
+            return config
+        
+        # Consul 中没有，尝试从 Redis 读取
+        return cls.get_redis_feature_flag_config(flag_name)
+
+    @classmethod
+    def get_feature_flag_config_prefer_redis(cls, flag_name: str) -> Optional[dict]:
+        """
+        获取特性开关配置，明确优先从 Redis 读取
+        
+        功能说明：
+        1. 优先从 Redis 读取配置（性能更好，延迟更低）
+        2. 如果 Redis 读取失败或不存在，回退到 Consul 读取
+        3. 如果两者都失败，返回 None
+        
+        使用场景：
+        - 对性能要求较高的场景
+        - 配置更新不频繁的场景
+        - 可以容忍配置延迟生效的场景
+        
+        :param flag_name: 特性开关名称
+        :return: 配置字典，如果不存在或读取失败则返回 None
+        """
+        # 优先从 Redis 读取
+        config = cls.get_redis_feature_flag_config(flag_name)
+        if config:
+            return config
+        
+        # Redis 中没有，尝试从 Consul 读取
+        return cls.get_consul_feature_flag_config(flag_name)
+
+    @classmethod
+    def get_all_feature_flag_config(cls, prefer_redis: bool = False) -> Optional[dict]:
+        """
+        获取所有特性开关配置，优先从 Consul 读取，如果不存在则从 Redis 读取
+        
+        功能说明：
+        1. 根据 prefer_redis 参数决定优先读取顺序
+        2. 如果 prefer_redis=False（默认），先尝试从 Consul 读取，失败则从 Redis 读取
+        3. 如果 prefer_redis=True，先尝试从 Redis 读取，失败则从 Consul 读取
+        4. 如果两者都失败，返回 None
+        
+        :param prefer_redis: 是否优先从 Redis 读取，默认 False（优先从 Consul 读取）
+        :return: 包含所有特性开关配置的字典，如果不存在或读取失败则返回 None
+        """
+        if prefer_redis:
+            # 优先从 Redis 读取
+            config = cls.get_all_redis_feature_flag_config()
+            if config:
+                return config
+            
+            # Redis 中没有，尝试从 Consul 读取
+            return cls.get_all_consul_feature_flag_config()
+        else:
+            # 优先从 Consul 读取
+            config = cls.get_all_consul_feature_flag_config()
+            if config:
+                return config
+            
+            # Consul 中没有，尝试从 Redis 读取
+            return cls.get_all_redis_feature_flag_config()
+
+    @classmethod
+    def get_all_feature_flag_config_prefer_consul(cls) -> Optional[dict]:
+        """
+        获取所有特性开关配置，明确优先从 Consul 读取
+        
+        功能说明：
+        1. 优先从 Consul 读取所有配置（作为配置中心，更新更及时）
+        2. 如果 Consul 读取失败或不存在，回退到 Redis 读取
+        3. 如果两者都失败，返回 None
+        
+        :return: 包含所有特性开关配置的字典，如果不存在或读取失败则返回 None
+        """
+        # 优先从 Consul 读取
+        config = cls.get_all_consul_feature_flag_config()
+        if config:
+            return config
+        
+        # Consul 中没有，尝试从 Redis 读取
+        return cls.get_all_redis_feature_flag_config()
+
+    @classmethod
+    def get_all_feature_flag_config_prefer_redis(cls) -> Optional[dict]:
+        """
+        获取所有特性开关配置，明确优先从 Redis 读取
+        
+        功能说明：
+        1. 优先从 Redis 读取所有配置（性能更好，延迟更低）
+        2. 如果 Redis 读取失败或不存在，回退到 Consul 读取
+        3. 如果两者都失败，返回 None
+        
+        :return: 包含所有特性开关配置的字典，如果不存在或读取失败则返回 None
+        """
+        # 优先从 Redis 读取
+        config = cls.get_all_redis_feature_flag_config()
+        if config:
+            return config
+        
+        # Redis 中没有，尝试从 Consul 读取
+        return cls.get_all_consul_feature_flag_config()
 
     @classmethod
     def get_feature_flag_value(cls, flag_name: str, table_id: Optional[str] = None, prefer_redis: bool = True) -> Optional[Any]:
@@ -504,3 +846,125 @@ class FeatureFlagConfig:
         default_variation = default_rule.get("variation", "Default")
         return variations.get(default_variation)
 
+    @classmethod
+    def get_consul_feature_flag_version(cls) -> Optional[dict]:
+        """
+        获取 Consul 中特性开关配置的版本信息
+        
+        功能说明：
+        1. 从 Consul 读取版本时间戳信息
+        2. 返回包含时间戳的字典
+        
+        返回值格式：
+        {
+            "time": 1640995200.123456  # Unix 时间戳
+        }
+        
+        :return: 版本信息字典，如果不存在则返回 None
+        """
+        # 从 settings 读取 Consul 配置，如果没有则使用默认值
+        consul_host = getattr(settings, "CONSUL_CLIENT_HOST", "127.0.0.1")
+        consul_port = getattr(settings, "CONSUL_CLIENT_PORT", 8500)
+        hash_consul = consul_tools.HashConsul(host=consul_host, port=consul_port)
+        
+        try:
+            # 从 Consul 读取版本信息
+            index, consul_data = hash_consul.get(cls.CONSUL_VERSION_PATH)
+            
+            if consul_data and consul_data.get("Value"):
+                # 获取 Value 字段（可能是 bytes 或字符串）
+                value_str = consul_data["Value"]
+                
+                # 如果 Value 是 bytes，需要先解码为字符串
+                if isinstance(value_str, bytes):
+                    value_str = value_str.decode("utf-8")
+                
+                # 如果 Value 是字符串，需要解析 JSON
+                if isinstance(value_str, str):
+                    return json.loads(value_str)
+                # 如果已经是字典，直接返回
+                elif isinstance(value_str, dict):
+                    return value_str
+            
+            # 如果 Consul 中没有该 key，返回 None
+            return None
+            
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error(f"get consul feature flag version error, error->[{e}]")
+            return None
+
+    @classmethod
+    def is_feature_flag_config_updated(cls, last_check_time: float) -> bool:
+        """
+        检查特性开关配置是否已更新
+        
+        功能说明：
+        1. 获取当前 Consul 中的版本时间戳
+        2. 与上次检查的时间戳进行比较
+        3. 如果当前时间戳大于上次检查时间戳，说明配置已更新
+        
+        使用场景：
+        - 查询模块可以定期调用此方法检查配置是否需要重新加载
+        - 避免频繁从 Consul 读取完整配置，提高性能
+        
+        :param last_check_time: 上次检查的时间戳（Unix 时间戳）
+        :return: True 表示配置已更新，False 表示未更新或检查失败
+        """
+        try:
+            # 获取当前版本信息
+            version_info = cls.get_consul_feature_flag_version()
+            
+            if not version_info:
+                # 如果获取不到版本信息，保守起见认为配置已更新
+                return True
+            
+            current_time = version_info.get("time", 0)
+            
+            # 如果当前时间戳大于上次检查时间戳，说明配置已更新
+            return current_time > last_check_time
+            
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error(f"check feature flag config update error, error->[{e}]")
+            # 发生异常时，保守起见认为配置已更新
+            return True
+
+    @classmethod
+    def force_refresh_feature_flag_config(cls):
+        """
+        强制刷新特性开关配置到 Consul 和 Redis
+        
+        功能说明：
+        1. 从数据库读取所有启用的特性开关配置
+        2. 同时刷新到 Consul 和 Redis
+        3. 更新版本时间戳
+        
+        使用场景：
+        - 管理员手动触发配置刷新
+        - 配置变更后需要立即生效时调用
+        
+        :return: None
+        """
+        from metadata.models.feature_flag import FeatureFlag
+        
+        # 1. 从数据库获取所有启用的特性开关配置
+        feature_flag_list = FeatureFlag.objects.filter(is_enabled=True)
+        
+        # 2. 构建配置字典
+        feature_flags_dict = {}
+        for feature_flag in feature_flag_list:
+            config_dict = feature_flag.to_config_dict()
+            if config_dict:
+                feature_flags_dict[feature_flag.flag_name] = config_dict
+        
+        # 3. 如果没有任何配置，记录警告并返回
+        if not feature_flags_dict:
+            logger.warning("no enabled feature flags found in database, skip force refresh")
+            return
+        
+        # 4. 刷新到 Consul
+        cls.refresh_consul_feature_flag_config(feature_flags_dict)
+        
+        # 5. 刷新到 Redis
+        cls.refresh_redis_feature_flag_config(feature_flags_dict)
+        
+        logger.info(f"force refresh feature flag config success, count->[{len(feature_flags_dict)}]")
