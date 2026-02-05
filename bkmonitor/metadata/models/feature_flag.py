@@ -35,6 +35,8 @@ class FeatureFlag(models.Model):
     config = JsonField("配置信息", default=dict) # 包含 variations、targeting、defaultRule 等字段
     is_enabled = models.BooleanField("是否启用", default=True, db_index=True)
     description = models.CharField("描述", max_length=512, default="", blank=True)
+    creator = models.CharField("创建者", max_length=32, default="system")
+    updater = models.CharField("变更人", max_length=32, default="system")
     created_at = models.DateTimeField("创建时间", auto_now_add=True)
     updated_at = models.DateTimeField("更新时间", auto_now=True)
 
@@ -61,18 +63,40 @@ class FeatureFlag(models.Model):
         重写 save 方法，在保存特性开关配置后自动刷新到 Consul 和 Redis
         
         功能说明：
-        1. 调用父类的 save 方法保存到数据库
-        2. 如果特性开关是启用的状态，刷新配置到 Consul 和 Redis
-        3. 如果特性开关被禁用，从 Consul 和 Redis 中移除该配置
+        1. 自动设置创建人和变更人字段
+        2. 调用父类的 save 方法保存到数据库
+        3. 如果特性开关是启用的状态，刷新配置到 Consul 和 Redis
+        4. 如果特性开关被禁用，从 Consul 和 Redis 中移除该配置
         
         使用场景：
         - 管理员在界面上修改特性开关配置后，自动同步到配置中心
         - 确保配置变更能够及时生效
         
         :param args: 位置参数
-        :param kwargs: 关键字参数
+        :param kwargs: 关键字参数，支持 operator 参数指定操作人
         """
-        # 1. 调用父类的 save 方法
+        # 1. 自动设置创建人和变更人字段
+        operator = kwargs.pop('operator', None)
+        if operator is None:
+            # 尝试从线程本地存储获取当前用户
+            try:
+                from bkmonitor.utils.user import get_global_user
+                operator = get_global_user()
+            except Exception:
+                pass
+        
+        if operator is None:
+            operator = "system"
+        
+        # 如果是新创建的对象，设置创建人
+        if not self.pk:
+            if not self.creator or self.creator == "system":
+                self.creator = operator
+        
+        # 设置变更人
+        self.updater = operator
+        
+        # 2. 调用父类的 save 方法
         super().save(*args, **kwargs)
         
         # 2. 自动刷新配置到 Consul 和 Redis
@@ -188,9 +212,17 @@ class FeatureFlagConfig:
             if config_dict:
                 feature_flags_dict[feature_flag.flag_name] = config_dict
         
-        # 3. 如果没有任何配置，记录警告并返回
+        # 3. 如果没有任何配置，清理 Consul 中的旧数据并返回
         if not feature_flags_dict:
-            logger.warning("no enabled feature flags found in database, skip refresh to consul")
+            logger.warning("no enabled feature flags found in database, clean consul and skip refresh")
+            # 清理 Consul 中的旧数据
+            try:
+                consul_path = cls.CONSUL_PREFIX_PATH
+                hash_consul.delete(consul_path)
+                hash_consul.delete(cls.CONSUL_VERSION_PATH)
+                logger.debug(f"cleaned consul path->[{consul_path}] and version path")
+            except Exception as e:  # pylint: disable=broad-except
+                logger.warning(f"failed to clean consul, error->[{e}]")
             return
         
         # 4. 构建 Consul 路径，格式: {CONSUL_PATH}/unify-query/data/feature_flag
@@ -234,9 +266,16 @@ class FeatureFlagConfig:
             if config_dict:
                 feature_flags_dict[feature_flag.flag_name] = config_dict
         
-        # 3. 如果没有任何配置，记录警告并返回
+        # 3. 如果没有任何配置，清理 Redis 中的旧数据并返回
         if not feature_flags_dict:
-            logger.warning("no enabled feature flags found in database, skip refresh to redis")
+            logger.warning("no enabled feature flags found in database, clean redis and skip refresh")
+            # 清理 Redis 中的旧数据
+            try:
+                redis_key = cls.REDIS_PREFIX_KEY
+                RedisTools().client.delete(redis_key)
+                logger.debug(f"cleaned redis key->[{redis_key}]")
+            except Exception as e:  # pylint: disable=broad-except
+                logger.warning(f"failed to clean redis, error->[{e}]")
             return
         
         # 4. 构建 Redis key，格式: bkmonitorv3:unify-query:data:feature_flag

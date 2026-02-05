@@ -29,7 +29,8 @@ def create_feature_flag(**kwargs):
     由于数据库表中有 bk_tenant_id 字段但模型定义中没有，需要特殊处理
     使用 SQL 直接插入来绕过模型字段验证
     """
-    from django.db import connection
+    from django.db import connections
+    from django.conf import settings
     import json
     
     # 准备字段值
@@ -37,84 +38,123 @@ def create_feature_flag(**kwargs):
     config = kwargs.get("config", {})
     is_enabled = kwargs.get("is_enabled", True)
     description = kwargs.get("description", "")
+    creator = kwargs.get("creator", "system")
+    updater = kwargs.get("updater", "system")
     
-    # 确保表存在
-    with connection.cursor() as cursor:
-        try:
-            cursor.execute("SHOW TABLES LIKE 'metadata_featureflag'")
-            if not cursor.fetchone():
-                # 表不存在，创建表
-                cursor.execute("""
-                    CREATE TABLE metadata_featureflag (
-                        bk_tenant_id VARCHAR(64) NOT NULL DEFAULT 'system',
-                        flag_id INT AUTO_INCREMENT PRIMARY KEY,
-                        flag_name VARCHAR(128) NOT NULL UNIQUE,
-                        display_name VARCHAR(128) DEFAULT '',
-                        description VARCHAR(512) DEFAULT '',
-                        config LONGTEXT NOT NULL,
-                        is_enabled BOOLEAN DEFAULT TRUE,
-                        created_at DATETIME(6) NOT NULL,
-                        updated_at DATETIME(6) NOT NULL,
-                        INDEX idx_flag_name (flag_name),
-                        INDEX idx_is_enabled (is_enabled)
-                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-                """)
-        except Exception:
-            pass  # 表可能已存在
+    # 确定要操作的数据库列表
+    databases_to_check = ['default']
+    try:
+        if hasattr(settings, 'DATABASES') and 'monitor_api' in settings.DATABASES:
+            databases_to_check.append('monitor_api')
+    except Exception:
+        pass  # 如果无法访问 settings，只使用 default
     
-    # 使用 SQL 直接插入（绕过模型字段验证）
     from django.utils import timezone
+    from django.utils.dateparse import parse_datetime
     now = timezone.now()
     
-    with connection.cursor() as cursor:
-        cursor.execute(
-            """
-            INSERT INTO metadata_featureflag 
-            (bk_tenant_id, flag_name, config, is_enabled, description, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            """,
-            ["system", flag_name, json.dumps(config), is_enabled, description, now, now]
-        )
-        flag_id = cursor.lastrowid
+    # 第一步：在所有数据库中创建表（如果不存在）
+    for db_alias in databases_to_check:
+        try:
+            connection = connections[db_alias]
+            with connection.cursor() as cursor:
+                try:
+                    cursor.execute("SHOW TABLES LIKE 'metadata_featureflag'")
+                    if not cursor.fetchone():
+                        # 表不存在，创建表
+                        cursor.execute("""
+                            CREATE TABLE metadata_featureflag (
+                                bk_tenant_id VARCHAR(64) NOT NULL DEFAULT 'system',
+                                flag_id INT AUTO_INCREMENT PRIMARY KEY,
+                                flag_name VARCHAR(128) NOT NULL UNIQUE,
+                                display_name VARCHAR(128) DEFAULT '',
+                                description VARCHAR(512) DEFAULT '',
+                                config LONGTEXT NOT NULL,
+                                is_enabled BOOLEAN DEFAULT TRUE,
+                                creator VARCHAR(32) DEFAULT 'system',
+                                updater VARCHAR(32) DEFAULT 'system',
+                                created_at DATETIME(6) NOT NULL,
+                                updated_at DATETIME(6) NOT NULL,
+                                INDEX idx_flag_name (flag_name),
+                                INDEX idx_is_enabled (is_enabled)
+                            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                        """)
+                except Exception:
+                    pass  # 表可能已存在
+        except Exception:
+            pass  # 数据库连接失败，跳过
     
-    # 使用原始 SQL 查询获取对象数据，然后手动创建对象实例
-    # 这样可以避免 Django ORM 的字段验证问题
-    with connection.cursor() as cursor:
-        cursor.execute(
-            """
-            SELECT flag_id, flag_name, config, is_enabled, description, created_at, updated_at
-            FROM metadata_featureflag
-            WHERE flag_name = %s
-            """,
-            [flag_name]
-        )
-        row = cursor.fetchone()
-        if row:
-            # 手动创建对象实例
-            flag = FeatureFlag()
-            flag.flag_id = row[0]
-            flag.flag_name = row[1]
-            flag.config = json.loads(row[2]) if isinstance(row[2], str) else row[2]
-            flag.is_enabled = bool(row[3])
-            flag.description = row[4] or ""
-            # 处理时区感知的 datetime
-            from django.utils.dateparse import parse_datetime
-            from django.utils import timezone
-            if isinstance(row[5], str):
-                dt = parse_datetime(row[5])
-                flag.created_at = timezone.make_aware(dt) if dt and timezone.is_naive(dt) else dt
-            else:
-                flag.created_at = row[5] if timezone.is_aware(row[5]) else timezone.make_aware(row[5])
-            if isinstance(row[6], str):
-                dt = parse_datetime(row[6])
-                flag.updated_at = timezone.make_aware(dt) if dt and timezone.is_naive(dt) else dt
-            else:
-                flag.updated_at = row[6] if timezone.is_aware(row[6]) else timezone.make_aware(row[6])
-            flag._state.adding = False  # 标记为已存在
-            flag._state.db = connection.alias
-            return flag
-        else:
-            raise ValueError(f"Failed to create feature flag: {flag_name}")
+    # 第二步：在所有数据库中插入数据（如果不存在）
+    for db_alias in databases_to_check:
+        try:
+            connection = connections[db_alias]
+            with connection.cursor() as cursor:
+                # 先检查是否已存在
+                cursor.execute("SELECT flag_id FROM metadata_featureflag WHERE flag_name = %s", [flag_name])
+                if not cursor.fetchone():
+                    # 不存在，插入数据
+                    cursor.execute(
+                        """
+                        INSERT INTO metadata_featureflag 
+                        (bk_tenant_id, flag_name, config, is_enabled, description, creator, updater, created_at, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        ["system", flag_name, json.dumps(config), is_enabled, description, creator, updater, now, now]
+                    )
+        except Exception:
+            pass  # 忽略错误，继续处理下一个数据库
+    
+    # 第三步：从数据库读取数据创建对象实例
+    # 优先从 monitor_api 数据库读取（如果存在），否则从 default 读取
+    read_order = []
+    try:
+        if hasattr(settings, 'DATABASES') and 'monitor_api' in settings.DATABASES:
+            read_order.append('monitor_api')
+    except Exception:
+        pass
+    read_order.append('default')
+    
+    for db_alias in read_order:
+        try:
+            connection = connections[db_alias]
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT flag_id, flag_name, config, is_enabled, description, creator, updater, created_at, updated_at
+                    FROM metadata_featureflag
+                    WHERE flag_name = %s
+                    """,
+                    [flag_name]
+                )
+                row = cursor.fetchone()
+                if row:
+                    # 手动创建对象实例
+                    flag = FeatureFlag()
+                    flag.flag_id = row[0]
+                    flag.flag_name = row[1]
+                    flag.config = json.loads(row[2]) if isinstance(row[2], str) else row[2]
+                    flag.is_enabled = bool(row[3])
+                    flag.description = row[4] or ""
+                    flag.creator = row[5] or "system"
+                    flag.updater = row[6] or "system"
+                    # 处理时区感知的 datetime
+                    if isinstance(row[7], str):
+                        dt = parse_datetime(row[7])
+                        flag.created_at = timezone.make_aware(dt) if dt and timezone.is_naive(dt) else dt
+                    else:
+                        flag.created_at = row[7] if timezone.is_aware(row[7]) else timezone.make_aware(row[7])
+                    if isinstance(row[8], str):
+                        dt = parse_datetime(row[8])
+                        flag.updated_at = timezone.make_aware(dt) if dt and timezone.is_naive(dt) else dt
+                    else:
+                        flag.updated_at = row[8] if timezone.is_aware(row[8]) else timezone.make_aware(row[8])
+                    flag._state.adding = False  # 标记为已存在
+                    flag._state.db = db_alias
+                    return flag
+        except Exception:
+            continue  # 尝试下一个数据库
+    
+    raise ValueError(f"Failed to create feature flag: {flag_name}")
 
 
 @pytest.fixture(autouse=True)
@@ -405,36 +445,49 @@ class TestFeatureFlagModel:
 
     @pytest.fixture(autouse=True, scope="class")
     def ensure_table_exists(self, django_db_blocker):
-        """确保表已创建"""
+        """确保表已创建（在所有相关数据库中）"""
         with django_db_blocker.unblock():
-            from django.db import connection
-            # 直接创建表（如果不存在）
-            with connection.cursor() as cursor:
+            from django.db import connections
+            from django.conf import settings
+            
+            # 在所有配置的数据库中创建表
+            databases_to_check = ['default']
+            try:
+                if hasattr(settings, 'DATABASES') and 'monitor_api' in settings.DATABASES:
+                    databases_to_check.append('monitor_api')
+            except Exception:
+                pass
+            
+            for db_alias in databases_to_check:
                 try:
-                    # 检查表是否存在
-                    cursor.execute("SHOW TABLES LIKE 'metadata_featureflag'")
-                    if not cursor.fetchone():
-                        # 表不存在，创建表
-                        cursor.execute("""
-                            CREATE TABLE metadata_featureflag (
-                                bk_tenant_id VARCHAR(64) NOT NULL DEFAULT 'system',
-                                flag_id INT AUTO_INCREMENT PRIMARY KEY,
-                                flag_name VARCHAR(128) NOT NULL UNIQUE,
-                                display_name VARCHAR(128) DEFAULT '',
-                                description VARCHAR(512) DEFAULT '',
-                                config LONGTEXT NOT NULL,
-                                is_enabled BOOLEAN DEFAULT TRUE,
-                                created_at DATETIME(6) NOT NULL,
-                                updated_at DATETIME(6) NOT NULL,
-                                INDEX idx_flag_name (flag_name),
-                                INDEX idx_is_enabled (is_enabled)
-                            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-                        """)
-                except Exception as e:
+                    connection = connections[db_alias]
+                    with connection.cursor() as cursor:
+                        # 检查表是否存在
+                        cursor.execute("SHOW TABLES LIKE 'metadata_featureflag'")
+                        if not cursor.fetchone():
+                            # 表不存在，创建表
+                            cursor.execute("""
+                                CREATE TABLE metadata_featureflag (
+                                    bk_tenant_id VARCHAR(64) NOT NULL DEFAULT 'system',
+                                    flag_id INT AUTO_INCREMENT PRIMARY KEY,
+                                    flag_name VARCHAR(128) NOT NULL UNIQUE,
+                                    display_name VARCHAR(128) DEFAULT '',
+                                    description VARCHAR(512) DEFAULT '',
+                                    config LONGTEXT NOT NULL,
+                                    is_enabled BOOLEAN DEFAULT TRUE,
+                                    creator VARCHAR(32) DEFAULT 'system',
+                                    updater VARCHAR(32) DEFAULT 'system',
+                                    created_at DATETIME(6) NOT NULL,
+                                    updated_at DATETIME(6) NOT NULL,
+                                    INDEX idx_flag_name (flag_name),
+                                    INDEX idx_is_enabled (is_enabled)
+                                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                            """)
+                except Exception:
                     # 如果创建失败，尝试运行迁移
-                    from django.core.management import call_command
                     try:
-                        call_command("migrate", "metadata", verbosity=0, interactive=False)
+                        from django.core.management import call_command
+                        call_command("migrate", "metadata", verbosity=0, interactive=False, database=db_alias)
                     except Exception:
                         pass  # 如果迁移也失败，让测试继续，看看具体错误
 
@@ -608,39 +661,83 @@ class TestFeatureFlagModel:
         with connection.cursor() as cursor:
             cursor.execute("DELETE FROM metadata_featureflag WHERE flag_name = %s", [flag.flag_name])
 
+    def test_feature_flag_creator_updater(self, sample_config):
+        """测试 creator 和 updater 字段"""
+        # 创建特性开关，指定 creator 和 updater
+        flag = create_feature_flag(
+            flag_name="test-creator-updater",
+            config=sample_config,
+            is_enabled=True,
+            creator="test_creator",
+            updater="test_updater",
+        )
+        
+        # 验证字段值
+        assert flag.creator == "test_creator"
+        assert flag.updater == "test_updater"
+        
+        # 测试默认值
+        flag2 = create_feature_flag(
+            flag_name="test-creator-updater-default",
+            config=sample_config,
+            is_enabled=True,
+        )
+        assert flag2.creator == "system"
+        assert flag2.updater == "system"
+        
+        # 清理
+        from django.db import connection
+        with connection.cursor() as cursor:
+            cursor.execute("DELETE FROM metadata_featureflag WHERE flag_name IN (%s, %s)", 
+                          ["test-creator-updater", "test-creator-updater-default"])
+
 
 class TestFeatureFlagConfigExtended:
     """FeatureFlagConfig 扩展测试类"""
 
     @pytest.fixture(autouse=True, scope="class")
     def ensure_table_exists(self, django_db_blocker):
-        """确保表已创建"""
+        """确保表已创建（在所有相关数据库中）"""
         with django_db_blocker.unblock():
-            from django.db import connection
-            # 直接创建表（如果不存在）
-            with connection.cursor() as cursor:
+            from django.db import connections
+            from django.conf import settings
+            
+            # 在所有配置的数据库中创建表
+            databases_to_check = ['default']
+            try:
+                if hasattr(settings, 'DATABASES') and 'monitor_api' in settings.DATABASES:
+                    databases_to_check.append('monitor_api')
+            except Exception:
+                pass
+            
+            for db_alias in databases_to_check:
                 try:
-                    # 检查表是否存在
-                    cursor.execute("SHOW TABLES LIKE 'metadata_featureflag'")
-                    if not cursor.fetchone():
-                        # 表不存在，创建表
-                        cursor.execute("""
-                            CREATE TABLE metadata_featureflag (
-                                bk_tenant_id VARCHAR(64) NOT NULL DEFAULT 'system',
-                                flag_id INT AUTO_INCREMENT PRIMARY KEY,
-                                flag_name VARCHAR(128) NOT NULL UNIQUE,
-                                display_name VARCHAR(128) DEFAULT '',
-                                description VARCHAR(512) DEFAULT '',
-                                config LONGTEXT NOT NULL,
-                                is_enabled BOOLEAN DEFAULT TRUE,
-                                created_at DATETIME(6) NOT NULL,
-                                updated_at DATETIME(6) NOT NULL,
-                                INDEX idx_flag_name (flag_name),
-                                INDEX idx_is_enabled (is_enabled)
-                            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-                        """)
-                except Exception:
-                    pass  # 表可能已存在
+                    connection = connections[db_alias]
+                    with connection.cursor() as cursor:
+                        # 检查表是否存在
+                        cursor.execute("SHOW TABLES LIKE 'metadata_featureflag'")
+                        if not cursor.fetchone():
+                            # 表不存在，创建表
+                            cursor.execute("""
+                                CREATE TABLE metadata_featureflag (
+                                    bk_tenant_id VARCHAR(64) NOT NULL DEFAULT 'system',
+                                    flag_id INT AUTO_INCREMENT PRIMARY KEY,
+                                    flag_name VARCHAR(128) NOT NULL UNIQUE,
+                                    display_name VARCHAR(128) DEFAULT '',
+                                    description VARCHAR(512) DEFAULT '',
+                                    config LONGTEXT NOT NULL,
+                                    is_enabled BOOLEAN DEFAULT TRUE,
+                                    creator VARCHAR(32) DEFAULT 'system',
+                                    updater VARCHAR(32) DEFAULT 'system',
+                                    created_at DATETIME(6) NOT NULL,
+                                    updated_at DATETIME(6) NOT NULL,
+                                    INDEX idx_flag_name (flag_name),
+                                    INDEX idx_is_enabled (is_enabled)
+                                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                            """)
+                except Exception as e:
+                    # 表可能已存在，或数据库连接失败，忽略错误
+                    pass
 
     @pytest.fixture(autouse=True)
     def cleanup_database(self):
